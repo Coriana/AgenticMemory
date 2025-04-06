@@ -1,0 +1,4 @@
+﻿__pycache__
+logs
+.env
+cached_memories_*

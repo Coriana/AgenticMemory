@@ -1,7 +1,7 @@
 import re
 import string
 import numpy as np
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Any, Optional
 import statistics
 from collections import defaultdict
 from rouge_score import rouge_scorer
@@ -16,6 +16,10 @@ from pathlib import Path
 from openai import OpenAI
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 from sentence_transformers.util import pytorch_cos_sim
+import sqlite3
+from datetime import datetime
+import json
+from text_utils import sanitize_text
 
 # Download required NLTK data
 try:
@@ -30,6 +34,68 @@ try:
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
+
+def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
+    """Set up logging configuration."""
+    logger = logging.getLogger('locomo_eval')
+    
+    # Prevent adding handlers if they already exist
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        # File handler if log_file is specified
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+    
+    return logger
+
+def init_llm_logging_db():
+    """Initialize SQLite database for logging LLM interactions"""
+    conn = sqlite3.connect('llm_logs.db')
+    c = conn.cursor()
+    
+    # Only create table if it doesn't exist
+    c.execute('''CREATE TABLE IF NOT EXISTS llm_interactions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp TEXT,
+                  model TEXT,
+                  prompt TEXT,
+                  response TEXT,
+                  temperature REAL,
+                  metadata TEXT,
+                  execution_time REAL)''')
+    conn.commit()
+    conn.close()
+
+def log_llm_interaction(model: str, prompt: str, response: str, 
+                       temperature: float, metadata: Dict[str, Any], 
+                       execution_time: float):
+    """Log an LLM interaction to SQLite database"""
+    conn = sqlite3.connect('llm_logs.db')
+    c = conn.cursor()
+    
+    # Sanitize all text fields
+    model = sanitize_text(model)
+    prompt = sanitize_text(prompt)
+    response = sanitize_text(response)
+    metadata_str = sanitize_text(str(metadata))
+    
+    # Insert with explicit column names
+    c.execute('''INSERT INTO llm_interactions 
+                 (timestamp, model, prompt, response, temperature, metadata, execution_time)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''', 
+              (datetime.now().isoformat(), model, prompt, response,
+               temperature, metadata_str, execution_time))
+    conn.commit()
+    conn.close()
 
 def simple_tokenize(text):
     """Simple tokenization function."""

@@ -15,6 +15,20 @@ import pickle
 from pathlib import Path
 from litellm import completion
 import time
+import torch
+import logging
+from utils import setup_logger
+from text_utils import sanitize_text
+
+# Generate automatic log filename with timestamp
+timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+log_filename = f"log_{timestamp}.log"
+log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
+
+# Create logs directory if it doesn't exist
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+logger = setup_logger(log_path)
 
 def simple_tokenize(text):
     return word_tokenize(text)
@@ -29,6 +43,8 @@ class OpenAIController(BaseLLMController):
     def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
         try:
             from openai import OpenAI
+            from utils import init_llm_logging_db
+            init_llm_logging_db()
             self.model = model
             if api_key is None:
                 api_key = os.getenv('OPENAI_API_KEY')
@@ -39,6 +55,8 @@ class OpenAIController(BaseLLMController):
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
     
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
+        from utils import log_llm_interaction
+        start_time = time.time()
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -49,11 +67,25 @@ class OpenAIController(BaseLLMController):
             temperature=temperature,
             max_tokens=1000
         )
-        return response.choices[0].message.content
+        execution_time = time.time() - start_time
+        content = response.choices[0].message.content
+        
+        # Log the interaction
+        log_llm_interaction(
+            model=self.model,
+            prompt=prompt,
+            response=content,
+            temperature=temperature,
+            metadata={"response_format": response_format},
+            execution_time=execution_time
+        )
+        return content
 
 class OllamaController(BaseLLMController):
     def __init__(self, model: str = "llama2"):
         from ollama import chat
+        from utils import init_llm_logging_db
+        init_llm_logging_db()
         self.model = model
     
     def _generate_empty_value(self, schema_type: str, schema_items: dict = None) -> Any:
@@ -84,6 +116,8 @@ class OllamaController(BaseLLMController):
         return result
 
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
+        from utils import log_llm_interaction
+        start_time = time.time()
         try:
             response = completion(
                 model="ollama_chat/{}".format(self.model),
@@ -93,10 +127,22 @@ class OllamaController(BaseLLMController):
                 ],
                 response_format=response_format,
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
         except Exception as e:
-            empty_response = self._generate_empty_response(response_format)
-            return json.dumps(empty_response)
+            content = json.dumps(self._generate_empty_response(response_format))
+        
+        execution_time = time.time() - start_time
+        
+        # Log the interaction
+        log_llm_interaction(
+            model=f"ollama_chat/{self.model}",
+            prompt=prompt,
+            response=content,
+            temperature=temperature,
+            metadata={"response_format": response_format},
+            execution_time=execution_time
+        )
+        return content
 
 class LLMController:
     """LLM-based controller for memory metadata generation"""
@@ -104,12 +150,16 @@ class LLMController:
                  backend: Literal["openai", "ollama"] = "openai",
                  model: str = "gpt-4", 
                  api_key: Optional[str] = None):
+        from utils import init_llm_logging_db
+        init_llm_logging_db()  # Initialize SQLite database
         if backend == "openai":
             self.llm = OpenAIController(model, api_key)
         elif backend == "ollama":
             self.llm = OllamaController(model)
         else:
             raise ValueError("Backend must be either 'openai' or 'ollama'")
+        self.model = model
+        self.backend = backend
 
 class MemoryNote:
     """Basic memory unit with metadata"""
@@ -133,7 +183,7 @@ class MemoryNote:
         # Generate metadata using LLM if not provided and controller is available
         if llm_controller and any(param is None for param in [keywords, context, category, tags]):
             analysis = self.analyze_content(content, llm_controller)
-            print("analysis", analysis)
+            print("analysis", sanitize_text(analysis))
             keywords = keywords or analysis["keywords"]
             context = context or analysis["context"]
             tags = tags or analysis["tags"]
@@ -158,38 +208,28 @@ class MemoryNote:
         self.tags = tags or []
 
     @staticmethod
-    def analyze_content(content: str, llm_controller: LLMController) -> Dict:            
+    def analyze_content(content: str, llm_controller: LLMController) -> Dict:
         """Analyze content to extract keywords, context, and other metadata"""
         prompt = """Generate a structured analysis of the following content by:
-            1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
-            2. Extracting core themes and contextual elements
-            3. Creating relevant categorical tags
+1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
+2. Extracting core themes and contextual elements
+3. Creating relevant categorical tags
 
-            Format the response as a JSON object:
-            {
-                "keywords": [
-                    // several specific, distinct keywords that capture key concepts and terminology
-                    // Order from most to least important
-                    // Don't include keywords that are the name of the speaker or time
-                    // At least three keywords, but don't be too redundant.
-                ],
-                "context": 
-                    // one sentence summarizing:
-                    // - Main topic/domain
-                    // - Key arguments/points
-                    // - Intended audience/purpose
-                ,
-                "tags": [
-                    // several broad categories/themes for classification
-                    // Include domain, format, and type tags
-                    // At least three tags, but don't be too redundant.
-                ]
-            }
+Format the response as a JSON object with the following structure:
+{
+    "keywords": ["keyword1", "keyword2", "keyword3"],
+    "context": "One sentence summary of the content",
+    "tags": ["tag1", "tag2", "tag3"]
+}
 
-            Content for analysis:
-            """ + content
+Content for analysis:
+""" + sanitize_text(content)
+            
         try:
-            response = llm_controller.llm.get_completion(prompt,response_format={"type": "json_schema", "json_schema": {
+            response = llm_controller.llm.get_completion(
+                sanitize_text(prompt),
+                response_format={"type": "json_schema", 
+                    "json_schema": {
                         "name": "response",
                         "schema": {
                             "type": "object",
@@ -214,23 +254,33 @@ class MemoryNote:
                             "additionalProperties": False
                         },
                         "strict": True
+                    }
                 }
-            })
+            )
             
+            # Sanitize the response before parsing
+            sanitized_response = sanitize_text(response)
             try:
-                analysis = json.loads(response)
-            except:
-                analysis = response
-            
-            return analysis
+                analysis = json.loads(sanitized_response)
+                # Validate the required fields
+                if not all(k in analysis for k in ["keywords", "context", "tags"]):
+                    raise ValueError("Missing required fields in response")
+                return analysis
+            except json.JSONDecodeError as e:
+                logger.info(f"JSON parsing error: {str(e)}")
+                logger.info(f"Raw response: {sanitized_response}")
+                # Return default values
+                return {
+                    "keywords": [],
+                    "context": "General",
+                    "tags": []
+                }
             
         except Exception as e:
-            print(f"Error analyzing content: {str(e)}")
-            print(f"Raw response: {response}")
+            logger.info(f"Error analyzing content: {str(e)}")
             return {
                 "keywords": [],
                 "context": "General",
-                "category": "Uncategorized",
                 "tags": []
             }
 
@@ -389,11 +439,8 @@ class SimpleEmbeddingRetriever:
     """Simple retrieval system using only text embeddings."""
     
     def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
-        """Initialize the simple embedding retriever.
-        
-        Args:
-            model_name: Name of the SentenceTransformer model to use
-        """
+        """Initialize the simple embedding retriever."""
+        logger.info(f"Initializing SimpleEmbeddingRetriever with model: {model_name}")
         self.model = SentenceTransformer(model_name)
         self.corpus = []
         self.embeddings = None
@@ -401,15 +448,18 @@ class SimpleEmbeddingRetriever:
         
     def add_documents(self, documents: List[str]):
         """Add documents to the retriever."""
+        logger.info(f"Adding {len(documents)} documents to retriever")
         # Reset if no existing documents
         if not self.corpus:
             self.corpus = documents
-            # print("documents", documents, len(documents))
+            logger.info("Encoding documents with SentenceTransformer")
             self.embeddings = self.model.encode(documents)
             self.document_ids = {doc: idx for idx, doc in enumerate(documents)}
+            logger.info(f"Created embeddings with shape: {self.embeddings.shape if self.embeddings is not None else 'None'}")
         else:
             # Append new documents
             start_idx = len(self.corpus)
+            logger.info(f"Appending {len(documents)} new documents, starting at index {start_idx}")
             self.corpus.extend(documents)
             new_embeddings = self.model.encode(documents)
             if self.embeddings is None:
@@ -418,29 +468,25 @@ class SimpleEmbeddingRetriever:
                 self.embeddings = np.vstack([self.embeddings, new_embeddings])
             for idx, doc in enumerate(documents):
                 self.document_ids[doc] = start_idx + idx
+            logger.info(f"Updated embeddings shape: {self.embeddings.shape if self.embeddings is not None else 'None'}")
     
     def search(self, query: str, k: int = 5) -> List[Dict[str, float]]:
-        """Search for similar documents using cosine similarity.
-        
-        Args:
-            query: Query text
-            k: Number of results to return
-            
-        Returns:
-            List of dicts with document text and score
-        """
+        """Search for similar documents using cosine similarity."""
+        logger.info(f"Searching for query: {sanitize_text(query)} with k={k}")
         if not self.corpus:
+            logger.warning("Search called on empty corpus")
             return []
-        # print("corpus", len(self.corpus), self.corpus)
+
         # Encode query
+        logger.info("Encoding search query")
         query_embedding = self.model.encode([query])[0]
         
         # Calculate cosine similarities
         similarities = cosine_similarity([query_embedding], self.embeddings)[0]
         # Get top k results
         top_k_indices = np.argsort(similarities)[-k:][::-1]
+        logger.info(f"Found {len(top_k_indices)} matching documents")
         
-            
         return top_k_indices
         
     def save(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
@@ -459,26 +505,26 @@ class SimpleEmbeddingRetriever:
     
     def load(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
         """Load retriever state from disk"""
-        print(f"Loading retriever from {retriever_cache_file} and {retriever_cache_embeddings_file}")
+        logger.info(f"Loading retriever from {sanitize_text(retriever_cache_file)} and {sanitize_text(retriever_cache_embeddings_file)}")
         
         # Load embeddings
         if os.path.exists(retriever_cache_embeddings_file):
-            print(f"Loading embeddings from {retriever_cache_embeddings_file}")
+            logger.info(f"Loading embeddings from {sanitize_text(retriever_cache_embeddings_file)}")
             self.embeddings = np.load(retriever_cache_embeddings_file)
-            print(f"Embeddings shape: {self.embeddings.shape}")
+            logger.info(f"Embeddings shape: {sanitize_text(self.embeddings.shape)}")
         else:
-            print(f"Embeddings file not found: {retriever_cache_embeddings_file}")
+            logger.info(f"Embeddings file not found: {sanitize_text(retriever_cache_embeddings_file)}")
         
         # Load other attributes
         if os.path.exists(retriever_cache_file):
-            print(f"Loading corpus from {retriever_cache_file}")
+            logger.info(f"Loading corpus from {sanitize_text(retriever_cache_file)}")
             with open(retriever_cache_file, 'rb') as f:
                 state = pickle.load(f)
                 self.corpus = state['corpus']
                 self.document_ids = state['document_ids']
-                print(f"Loaded corpus with {len(self.corpus)} documents")
+                logger.info(f"Loaded corpus with {sanitize_text(len(self.corpus))} documents")
         else:
-            print(f"Corpus file not found: {retriever_cache_file}")
+            logger.info(f"Corpus file not found: {sanitize_text(retriever_cache_file)}")
             
         return self
 
@@ -508,37 +554,36 @@ class AgenticMemorySystem:
         self.memories = {}  # id -> MemoryNote
         self.retriever = SimpleEmbeddingRetriever(model_name)
         self.llm_controller = LLMController(llm_backend, llm_model, api_key)
-        self.evolution_system_prompt = '''
-                                You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
-                                Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
-                                Make decisions about its evolution.  
+        self.evolution_system_prompt = '''You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
+Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
+Make decisions about its evolution.  
 
-                                The new memory context:
-                                {context}
-                                content: {content}
-                                keywords: {keywords}
+The new memory context:
+{context}
+content: {content}
+keywords: {keywords}
 
-                                The nearest neighbors memories:
-                                {nearest_neighbors_memories}
+The nearest neighbors memories:
+{nearest_neighbors_memories}
 
-                                Based on this information, determine:
-                                1. Should this memory be evolved? Consider its relationships with other memories.
-                                2. What specific actions should be taken (strengthen, update_neighbor)?
-                                   2.1 If choose to strengthen the connection, which memory should it be connected to? Can you give the updated tags of this memory?
-                                   2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
-                                Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
-                                Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
-                                The number of neighbors is {neighbor_number}.
-                                Return your decision in JSON format with the following structure:
-                                {{
-                                    "should_evolve": True or False,
-                                    "actions": ["strengthen", "update_neighbor"],
-                                    "suggested_connections": ["neighbor_memory_ids"],
-                                    "tags_to_update": ["tag_1",..."tag_n"], 
-                                    "new_context_neighborhood": ["new context",...,"new context"],
-                                    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
-                                }}
-                                '''
+Based on this information, determine:
+1. Should this memory be evolved? Consider its relationships with other memories.
+2. What specific actions should be taken (strengthen, update_neighbor)?
+    2.1 If choose to strengthen the connection, which memory should it be connected to? Can you give the updated tags of this memory?
+    2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
+Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
+Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
+The number of neighbors is {neighbor_number}.
+Return your decision in JSON format with the following structure:
+{{
+    "should_evolve": True or False,
+    "actions": ["strengthen", "update_neighbor"],
+    "suggested_connections": ["neighbor_memory_ids"],
+    "tags_to_update": ["tag_1",..."tag_n"], 
+    "new_context_neighborhood": ["new context",...,"new context"],
+    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
+}}
+'''
         self.evo_cnt = 0 
         self.evo_threshold = evo_threshold
 
@@ -575,19 +620,31 @@ class AgenticMemorySystem:
         self.retriever = SimpleEmbeddingRetriever(model_name)
         
         # Re-add all memory documents with their metadata
+        all_docs_to_add = []
         for memory in self.memories.values():
-            # Combine memory metadata into a single searchable document
-            metadata_text = f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)}"
-            # Add both the content and metadata as separate documents for better retrieval
-            self.retriever.add_documents([memory.content + " , " + metadata_text])
+            # Combine memory metadata into a single searchable document, consistent with add_note
+            doc_string = f"{memory.context} keywords: {', '.join(memory.keywords)}"
+            all_docs_to_add.append(doc_string)
+
+        if all_docs_to_add:
+            self.retriever.add_documents(all_docs_to_add)
     
     def process_memory(self, note: MemoryNote) -> bool:
         """Process a memory note and return an evolution label"""
-        neighbor_memory, indices = self.find_related_memories(note.content, k=5)
-        prompt_memory = self.evolution_system_prompt.format(context=note.context, content=note.content, keywords=note.keywords, nearest_neighbors_memories=neighbor_memory,neighbor_number=len(indices))
-        print("prompt_memory", prompt_memory)
-        response = self.llm_controller.llm.get_completion(
-            prompt_memory,response_format={"type": "json_schema", "json_schema": {
+        neighbor_memory, indices = self.find_related_memories(note.content, k=11)
+        prompt_memory = self.evolution_system_prompt.format(
+            context=sanitize_text(note.context),  # Added context parameter
+            content=sanitize_text(note.content), 
+            keywords=sanitize_text(str(note.keywords)), 
+            nearest_neighbors_memories=sanitize_text(neighbor_memory),
+            neighbor_number=len(indices)
+        )
+
+        try:
+            response = self.llm_controller.llm.get_completion(
+                prompt_memory,
+                response_format={"type": "json_schema", 
+                    "json_schema": {
                         "name": "response",
                         "schema": {
                             "type": "object",
@@ -633,44 +690,55 @@ class AgenticMemorySystem:
                             "additionalProperties": False
                         },
                         "strict": True
-                    }}
-        )
-        # try:
-        # print("response", response, type(response))
-        response_json = json.loads(response)
-        print("response_json", response_json, type(response_json))
-        # except:
-        #     response_json = response
-        should_evolve = response_json["should_evolve"]
-        if should_evolve:
-            actions = response_json["actions"]
-            for action in actions:
-                if action == "strengthen":
-                    suggest_connections = response_json["suggested_connections"]
-                    new_tags = response_json["tags_to_update"]
-                    note.links.extend(suggest_connections)
-                    note.tags = new_tags
-                elif action == "update_neighbor":
-                    new_context_neighborhood = response_json["new_context_neighborhood"]
-                    new_tags_neighborhood = response_json["new_tags_neighborhood"]
-                    noteslist = list(self.memories.values())
-                    notes_id = list(self.memories.keys())
-                    print("indices", indices)
-                    # if slms output less than the number of neighbors, use the sequential order of new tags and context.
-                    for i in range(min(len(indices), len(new_tags_neighborhood))):
-                        # find some memory
-                        tag = new_tags_neighborhood[i]
-                        if i < len(new_context_neighborhood):
-                            context = new_context_neighborhood[i]
-                        else:
-                            context = noteslist[indices[i]].context
-                        memorytmp_idx = indices[i]
-                        notetmp = noteslist[memorytmp_idx]
-                        # add tag to memory
-                        notetmp.tags = tag
-                        notetmp.context = context
-                        self.memories[notes_id[memorytmp_idx]] = notetmp
-        return should_evolve,note
+                    }
+                }
+            )
+
+            # Try to parse the response as JSON
+            try:
+                response_json = json.loads(sanitize_text(response))
+            except json.JSONDecodeError as e:
+                logger.info(f"JSON parsing error: {sanitize_text(str(e))}")
+                logger.info(f"Raw response: {sanitize_text(response)}")
+                # Return default values if JSON parsing fails
+                return False, note
+
+            # Process the valid JSON response
+            should_evolve = response_json.get("should_evolve", False)
+            if should_evolve:
+                actions = response_json.get("actions", [])
+                for action in actions:
+                    if action == "strengthen":
+                        suggest_connections = response_json.get("suggested_connections", [])
+                        new_tags = response_json.get("tags_to_update", [])
+                        note.links.extend(suggest_connections)
+                        note.tags = new_tags
+                    elif action == "update_neighbor":
+                        new_context_neighborhood = response_json.get("new_context_neighborhood", [])
+                        new_tags_neighborhood = response_json.get("new_tags_neighborhood", [])
+                        noteslist = list(self.memories.values())
+                        notes_id = list(self.memories.keys())
+
+                        for i in range(min(len(indices), len(new_tags_neighborhood))):
+                            if i >= len(indices):
+                                break
+                            
+                            tag = new_tags_neighborhood[i]
+                            context = new_context_neighborhood[i] if i < len(new_context_neighborhood) else noteslist[indices[i]].context
+                            memorytmp_idx = indices[i]
+                            
+                            if memorytmp_idx < len(noteslist):
+                                notetmp = noteslist[memorytmp_idx]
+                                notetmp.tags = tag
+                                notetmp.context = context
+                                if memorytmp_idx < len(notes_id):
+                                    self.memories[notes_id[memorytmp_idx]] = notetmp
+
+            return should_evolve, note
+
+        except Exception as e:
+            logger.info(f"Error in process_memory: {sanitize_text(str(e))}")
+            return False, note
 
     def find_related_memories(self, query: str, k: int = 5) -> List[MemoryNote]:
         """Find related memories using hybrid retrieval"""
@@ -684,8 +752,8 @@ class AgenticMemorySystem:
         # Convert to list of memories
         all_memories = list(self.memories.values())
         memory_str = ""
-        # print("indices", indices)
-        # print("all_memories", all_memories)
+        # print("indices", sanitize_text(indices))
+        # print("all_memories", sanitize_text(all_memories))
         for i in indices:
             memory_str += "memory index:" + str(i) + "\t talk start time:" + all_memories[i].timestamp + "\t memory content: " + all_memories[i].content + "\t memory context: " + all_memories[i].context + "\t memory keywords: " + str(all_memories[i].keywords) + "\t memory tags: " + str(all_memories[i].tags) + "\n"
         return memory_str, indices
@@ -704,10 +772,10 @@ class AgenticMemorySystem:
         memory_str = ""
         j = 0
         for i in indices:
-            memory_str +=  "talk start time:" + all_memories[i].timestamp + "memory content: " + all_memories[i].content + "memory context: " + all_memories[i].context + "memory keywords: " + str(all_memories[i].keywords) + "memory tags: " + str(all_memories[i].tags) + "\n"
+            memory_str +=  "talk start time:" + all_memories[i].timestamp + " memory content: " + all_memories[i].content + "memory context: " + all_memories[i].context + "memory keywords: " + str(all_memories[i].keywords) + "memory tags: " + str(all_memories[i].tags) + "\n"
             neighborhood = all_memories[i].links
             for neighbor in neighborhood:
-                memory_str += "talk start time:" + all_memories[neighbor].timestamp + "memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
+                memory_str += "talk start time:" + all_memories[neighbor].timestamp + " memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
                 if j >=k:
                     break
                 j += 1
@@ -743,15 +811,15 @@ def run_tests():
     )
     
     related = memory_system.find_related_memories(query.content, k=2)
-    print("related", related)
+    print("related", sanitize_text(related))
     print("\nResults:")
     for i, memory in enumerate(related, 1):
-        print(f"\n{i}. Memory:")
-        print(f"Content: {memory.content}")
-        print(f"Category: {memory.category}")
-        print(f"Keywords: {memory.keywords}")
-        print(f"Tags: {memory.tags}")
-        print(f"Context: {memory.context}")
+        logger.info(f"\n{i}. Memory:")
+        logger.info(f"Content: {memory.content}")
+        logger.info(f"Category: {memory.category}")
+        logger.info(f"Keywords: {memory.keywords}")
+        logger.info(f"Tags: {memory.tags}")
+        logger.info(f"Context: {memory.context}")
         print("-" * 50)
 
 if __name__ == "__main__":

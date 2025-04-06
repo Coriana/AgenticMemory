@@ -1,4 +1,5 @@
 from memory_layer import LLMController, AgenticMemorySystem
+from text_utils import sanitize_text
 import os
 import json
 import argparse
@@ -17,23 +18,56 @@ from collections import defaultdict
 import pickle
 import random
 from tqdm import tqdm
-from utils import calculate_metrics, aggregate_metrics
+from utils import calculate_metrics, aggregate_metrics, setup_logger
 from datetime import datetime
 
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('wordnet')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('wordnet')
+def evaluate_with_llm(llm_controller: LLMController, question: str, prediction: str, reference: str, context: str) -> Dict:
+    """Evaluate the prediction using an LLM."""
+    prompt = f"""Please evaluate the quality of the provided 'Prediction' based on the 'Reference Answer', 'Question', and 'Context'. Consider:
+1. Correctness - How well does it match the reference answer?
+2. Relevance - Does it address the question?
+3. Context usage - Does it use the context appropriately?
 
-# Initialize SentenceTransformer model (this will be reused)
-try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    print(f"Warning: Could not load SentenceTransformer model: {e}")
-    sentence_model = None
+Question: {question}
+Context: {context}
+Prediction: {prediction}
+Reference Answer: {reference}
+
+Score from 1-5 where:
+1 = Completely incorrect/irrelevant
+2 = Mostly incorrect but has some valid points
+3 = Partially correct
+4 = Mostly correct with minor issues
+5 = Completely correct and relevant
+
+Return your evaluation as a JSON object with:
+- "score" (integer 1-5)
+- "justification" (string explaining the score)
+"""
+    try:
+        response = llm_controller.llm.get_completion(
+            prompt,
+            response_format={"type": "json_schema", 
+                "json_schema": {
+                    "name": "llm_evaluation",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                            "justification": {"type": "string"}
+                        },
+                        "required": ["score", "justification"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            temperature=0.3
+        )
+        evaluation = json.loads(response)
+        return evaluation
+    except Exception as e:
+        logger.error(f"LLM evaluation failed: {str(e)}")
+        return {"score": 0, "justification": f"Evaluation failed: {str(e)}"}
 
 class advancedMemAgent:
     def __init__(self, model, backend, retrieve_k, temperature_c5):
@@ -81,7 +115,7 @@ class advancedMemAgent:
                             },
                             "strict": True
                         }})
-        # print("response:{}".format(response))
+        # print(sanitize_text("response:{}".format(response)))
         return response
     
     def generate_query_llm(self, question):
@@ -109,7 +143,7 @@ class advancedMemAgent:
                             },
                             "strict": True
                         }})
-        print("response:{}".format(response))
+        print(sanitize_text("response:{}".format(response)))
         try:
             response = json.loads(response)["keywords"]
         except:
@@ -125,7 +159,7 @@ class advancedMemAgent:
         # else:
         raw_context = self.retrieve_memory(keywords,k=self.retrieve_k)
         context = raw_context
-        # print("context:", context)
+        # print(sanitize_text("context:", context))
         # context = self.retrieve_memory_llm(raw_context, question)
         # context = raw_context
         assert category in [1,2,3,4,5]
@@ -184,29 +218,10 @@ class advancedMemAgent:
                         "strict": True
                     }},temperature=temperature
         )
-        # print(response)
+        # print(sanitize_text(response))
         return response,user_prompt,raw_context
 
-def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
-    """Set up logging configuration."""
-    logger = logging.getLogger('locomo_eval')
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler if log_file is specified
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    
-    return logger
-
-def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "openai", temperature_c5: float = 0.5, retrieve_k: int = 10):
+def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "openai", temperature_c5: float = 0.5, retrieve_k: int = 10, logger=None):
     """Evaluate the agent on the LoComo dataset.
     
     Args:
@@ -214,39 +229,42 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         model: Name of the model to use
         output_path: Path to save results
         ratio: Ratio of dataset to evaluate
+        backend: Backend to use (openai or ollama)
+        temperature_c5: Temperature for C5 category questions
+        retrieve_k: Number of memories to retrieve
+        logger: Logger instance to use
     """
-    # Generate automatic log filename with timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    log_filename = f"eval_ours_{model}_{backend}_ratio{ratio}_{timestamp}.log"
-    log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
-    
-    # Create logs directory if it doesn't exist
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    
-    logger = setup_logger(log_path)
-    logger.info(f"Loading dataset from {dataset_path}")
+    if logger is None:
+        logger = setup_logger()
+
+    logger.info(sanitize_text(f"Loading dataset from {dataset_path}"))
     
     # Load dataset
     samples = load_locomo_dataset(dataset_path)
-    logger.info(f"Loaded {len(samples)} samples")
+    logger.info(sanitize_text(f"Loaded {len(samples)} samples"))
+    
+    # Shuffle samples randomly
+    # random.shuffle(samples)
+    # logger.info("Randomly shuffled samples")
     
     # Select subset of samples based on ratio
     if ratio < 1.0:
         num_samples = max(1, int(len(samples) * ratio))
         samples = samples[:num_samples]
-        logger.info(f"Using {num_samples} samples ({ratio*100:.1f}% of dataset)")
+        logger.info(sanitize_text(f"Using {num_samples} samples ({ratio*100:.1f}% of dataset)"))
     
     # Store results
     results = []
     all_metrics = []
     all_categories = []
+    all_llm_scores = [] # Add list for LLM scores
     total_questions = 0
     category_counts = defaultdict(int)
+    error_num = 0
     
     # Evaluate each sample
     i = 0
-    error_num = 0
-    memories_dir = os.path.join(os.path.dirname(__file__), "cached_memories_advanced_{}_{}".format(backend, model))
+    memories_dir = os.path.join(os.path.dirname(__file__), "13_cached_memories_advanced_{}_{}".format(backend, model))
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1,2,3,4,5]
     for sample_idx, sample in enumerate(samples):
@@ -267,33 +285,33 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
         # Check if cached memories exist
         if os.path.exists(memory_cache_file):
-            logger.info(f"Loading cached memories for sample {sample_idx}")
+            logger.info(sanitize_text(f"Loading cached memories for sample {sample_idx}"))
             # try:
             with open(memory_cache_file, 'rb') as f:
                 cached_memories = pickle.load(f)
             # Restore memories to agent
             agent.memory_system.memories = cached_memories
             if os.path.exists(retriever_cache_file):
-                print(f"Found retriever cache files:")
-                print(f"  - Retriever cache: {retriever_cache_file}")
-                print(f"  - Embeddings cache: {retriever_cache_embeddings_file}")
+                logger.info(sanitize_text(f"Found retriever cache files:"))
+                logger.info(sanitize_text(f"  - Retriever cache: {retriever_cache_file}"))
+                logger.info(sanitize_text(f"  - Embeddings cache: {retriever_cache_embeddings_file}"))
                 agent.memory_system.retriever = agent.memory_system.retriever.load(retriever_cache_file,retriever_cache_embeddings_file)
             else:
-                print(f"No retriever cache found at {retriever_cache_file}, loading from memory")
+                logger.info(sanitize_text(f"No retriever cache found at {retriever_cache_file}, loading from memory"))
                 agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(cached_memories, 'all-MiniLM-L6-v2')
-            print(agent.memory_system.retriever.corpus)
-            logger.info(f"Successfully loaded {len(cached_memories)} memories")
+            print(sanitize_text(agent.memory_system.retriever.corpus))
+            logger.info(sanitize_text(f"Successfully loaded {len(cached_memories)} memories"))
             # except Exception as e:
             #     logger.info(f"Error loading cached memories: {e}. Will recreate memories.")
             #     cached_memories = None
         else:
-            logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
+            logger.info(sanitize_text(f"No cached memories found for sample {sample_idx}. Creating new memories."))
             cached_memories = None
 
             for _,turns in sample.conversation.sessions.items():
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
-                    conversation_tmp = "Speaker "+ turn.speaker + "says : " + turn.text
+                    conversation_tmp = "Speaker "+ turn.speaker + " says: " + turn.text
                     agent.add_memory(conversation_tmp,time=turn_datatime)
                     # break
                 #     i +=1
@@ -304,9 +322,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             with open(memory_cache_file, 'wb') as f:
                 pickle.dump(memories_to_cache, f)
             agent.memory_system.retriever.save(retriever_cache_file,retriever_cache_embeddings_file)
-            logger.info(f"\nSuccessfully cached {len(memories_to_cache)} memories")
+            logger.info(sanitize_text(f"\nSuccessfully cached {len(memories_to_cache)} memories"))
             
-        logger.info(f"\nProcessing sample {sample_idx + 1}/{len(samples)}")
+        logger.info(sanitize_text(f"\nProcessing sample {sample_idx + 1}/{len(samples)}"))
         
         for qa in sample.qa:
             if int(qa.category) in allow_categories:
@@ -314,30 +332,42 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 category_counts[qa.category] += 1
                 
                 # Generate prediction
-                prediction, user_prompt,raw_context = agent.answer_question(qa.question,qa.category,qa.final_answer)
+                prediction, user_prompt, raw_context = agent.answer_question(qa.question, qa.category, qa.final_answer)
                 try:
                     prediction = json.loads(prediction)["answer"]
                 except:
                     prediction = prediction
-                    logger.info(f"Failed to parse prediction as JSON: {prediction}")
+                    logger.info(sanitize_text(f"Failed to parse prediction as JSON: {prediction}"))
                     error_num += 1
+
                 # Log results
-                logger.info(f"\nQuestion {total_questions}: {qa.question}")
-                logger.info(f"Prediction: {prediction}")
-                logger.info(f"Reference: {qa.final_answer}")
-                logger.info(f"User Prompt: {user_prompt}")
-                logger.info(f"Category: {qa.category}")
-                logger.info(f"Raw Context: {raw_context}")
-                
-                # Calculate metrics
+                logger.info(sanitize_text(f"\nQuestion {total_questions}: {qa.question}"))
+                logger.info(sanitize_text(f"Prediction: {prediction}"))
+                logger.info(sanitize_text(f"Reference: {qa.final_answer}"))
+                logger.info(sanitize_text(f"Category: {qa.category}"))
+
+                # Calculate standard metrics
                 metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
                     "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0, 
                     "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0, 
                     "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
                 }
+
+                # Get LLM evaluation
+                llm_eval = evaluate_with_llm(
+                    agent.retriever_llm,
+                    qa.question,
+                    prediction,
+                    qa.final_answer,
+                    raw_context
+                )
+                
+                logger.info(sanitize_text(f"LLM Score: {llm_eval['score']}"))
+                logger.info(sanitize_text(f"LLM Justification: {llm_eval['justification']}"))
                 
                 all_metrics.append(metrics)
                 all_categories.append(qa.category)
+                all_llm_scores.append(llm_eval['score'])
                 
                 # Store individual result
                 result = {
@@ -346,17 +376,44 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "prediction": prediction,
                     "reference": qa.final_answer,
                     "category": qa.category,
-                    "metrics": metrics
+                    "metrics": metrics,
+                    "llm_score": llm_eval['score'],
+                    "llm_justification": llm_eval['justification']
                 }
                 results.append(result)
                 
                 # Log progress
                 if total_questions % 10 == 0:
-                    logger.info(f"Processed {total_questions} questions")
+                    logger.info(sanitize_text(f"Processed {total_questions} questions"))
     
     # Calculate aggregate metrics
     aggregate_results = aggregate_metrics(all_metrics, all_categories)
     
+    # Add LLM score aggregation
+    valid_llm_scores = [s for s in all_llm_scores if s > 0]  # Filter out failed evaluations
+    if valid_llm_scores:
+        aggregate_results["overall"]["llm_scores"] = {
+            "mean": float(np.mean(valid_llm_scores)),
+            "median": float(np.median(valid_llm_scores)),
+            "std": float(np.std(valid_llm_scores)),
+            "min": float(np.min(valid_llm_scores)),
+            "max": float(np.max(valid_llm_scores))
+        }
+        # Add per-category LLM scores
+        for cat in set(all_categories):
+            cat_scores = [s for s, c in zip(all_llm_scores, all_categories) if c == cat and s > 0]
+            if cat_scores:
+                cat_key = f"category_{cat}"
+                if cat_key not in aggregate_results:
+                    aggregate_results[cat_key] = {}
+                aggregate_results[cat_key]["llm_scores"] = {
+                    "mean": float(np.mean(cat_scores)),
+                    "median": float(np.median(cat_scores)),
+                    "std": float(np.std(cat_scores)),
+                    "min": float(np.min(cat_scores)),
+                    "max": float(np.max(cat_scores))
+                }
+
     # Prepare final results
     final_results = {
         "model": model,
@@ -368,27 +425,31 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "aggregate_metrics": aggregate_results,
         "individual_results": results
     }
-    logger.info(f"Error number: {error_num}")
+    logger.info(sanitize_text(f"Error number: {error_num}"))
+    
     # Save results
     if output_path:
         with open(output_path, 'w') as f:
             json.dump(final_results, f, indent=2)
-        logger.info(f"Results saved to {output_path}")
+        logger.info(sanitize_text(f"Results saved to {output_path}"))
     
-    # Log summary
-    logger.info("\nEvaluation Summary:")
-    logger.info(f"Total questions evaluated: {total_questions}")
-    logger.info("\nCategory Distribution:")
+    # Log summary with LLM scores
+    logger.info(sanitize_text("\nEvaluation Summary:"))
+    logger.info(sanitize_text(f"Total questions evaluated: {total_questions}"))
+    logger.info(sanitize_text("\nCategory Distribution:"))
     for category, count in sorted(category_counts.items()):
-        logger.info(f"Category {category}: {count} questions ({count/total_questions*100:.1f}%)")
+        logger.info(sanitize_text(f"Category {category}: {count} questions ({count/total_questions*100:.1f}%)"))
     
-    logger.info("\nAggregate Metrics:")
+    logger.info(sanitize_text("\nAggregate Metrics:"))
     for split_name, metrics in aggregate_results.items():
-        logger.info(f"\n{split_name.replace('_', ' ').title()}:")
+        logger.info(sanitize_text(f"\n{split_name.replace('_', ' ').title()}:"))
         for metric_name, stats in metrics.items():
-            logger.info(f"  {metric_name}:")
-            for stat_name, value in stats.items():
-                logger.info(f"    {stat_name}: {value:.4f}")
+            if isinstance(stats, dict):  # Handle nested metrics like llm_scores
+                logger.info(sanitize_text(f"  {metric_name}:"))
+                for stat_name, value in stats.items():
+                    logger.info(sanitize_text(f"    {stat_name}: {value:.4f}"))
+            else:
+                logger.info(sanitize_text(f"  {metric_name}: {stats:.4f}"))
     
     return final_results
 
@@ -412,6 +473,33 @@ def main():
     
     if args.ratio <= 0.0 or args.ratio > 1.0:
         raise ValueError("Ratio must be between 0.0 and 1.0")
+        
+    # Generate automatic log filename with timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+    eval_log_filename = f"eval_ours_{args.model}_{args.backend}_ratio{args.ratio}_{timestamp}.log"
+    eval_log_path = os.path.join(os.path.dirname(__file__), "logs", eval_log_filename)
+
+    # Create logs directory if it doesn't exist
+    os.makedirs(os.path.dirname(eval_log_path), exist_ok=True)
+
+    # Initialize logger
+    logger = setup_logger(eval_log_path)
+    
+    # Download required NLTK data
+    nltk_resources = ['punkt', 'wordnet', 'averaged_perceptron_tagger', 'punkt_tab']
+    for resource in nltk_resources:
+        try:
+            nltk.data.find(f'tokenizers/{resource}')
+        except LookupError:
+            logger.info(sanitize_text(f"Downloading {resource}..."))
+            nltk.download(resource)
+
+    # Initialize SentenceTransformer model (this will be reused)
+    try:
+        sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception as e:
+        logger.info(sanitize_text(f"Warning: Could not load SentenceTransformer model: {e}"))
+        sentence_model = None
     
     # Convert relative path to absolute path
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
@@ -420,7 +508,7 @@ def main():
     else:
         output_path = None
     
-    evaluate_dataset(dataset_path, args.model, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k)
+    evaluate_dataset(dataset_path, args.model, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k, logger)
 
 if __name__ == "__main__":
     main()
