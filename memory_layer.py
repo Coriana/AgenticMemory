@@ -810,10 +810,12 @@ def run_tests():
         llm_controller=memory_system.llm_controller
     )
     
-    related = memory_system.find_related_memories(query.content, k=2)
-    print("related", sanitize_text(related))
+    related_str, indices = memory_system.find_related_memories(query.content, k=2)
+    print("related", sanitize_text(related_str))
     print("\nResults:")
-    for i, memory in enumerate(related, 1):
+    notes = list(memory_system.memories.values())
+    for i, idx in enumerate(indices, 1):
+        memory = notes[idx]
         logger.info(f"\n{i}. Memory:")
         logger.info(f"Content: {memory.content}")
         logger.info(f"Category: {memory.category}")
